@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the C375 ESGF replication dashboard
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/abennasser/c3s/dashboard
+EnvironmentFile=/home/abennasser/c3s/c375-report.env
+ExecStart=/usr/bin/python3 /home/abennasser/c3s/dashboard/update_c375_report.py
+UMask=0077
+
