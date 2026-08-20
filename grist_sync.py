@@ -18,7 +18,7 @@ INTEGER_FIELDS = {
     "complete_rows", "in_progress_rows", "error_rows", "no_match_rows",
     "not_configured_rows", "row_count",
 }
-FLOAT_FIELDS = {"completion", "downloaded_tib", "total_tib"}
+FLOAT_FIELDS = {"completion", "downloaded_tib", "total_tib", "remaining_tib"}
 
 
 def human_size(value: str | int | float) -> str:

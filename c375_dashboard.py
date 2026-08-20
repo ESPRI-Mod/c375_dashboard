@@ -281,6 +281,7 @@ def write_snapshot(rows: list[dict], output: Path) -> None:
             "completion": done_bytes / total_bytes if total_bytes else 0.0,
             "downloaded_tib": done_bytes / 2**40,
             "total_tib": total_bytes / 2**40,
+            "remaining_tib": max(total_bytes - done_bytes, 0) / 2**40,
         }
         summary_rows.append(summary)
     with summary_path.open("w", newline="", encoding="utf-8") as handle:
@@ -289,12 +290,22 @@ def write_snapshot(rows: list[dict], output: Path) -> None:
         writer.writerows(summary_rows)
 
     status_path = output.with_name("c375_status_summary.csv")
-    status_rows = [
-        {"status": state, "row_count": sum(row["replication_state"] == state for row in rows)}
-        for state in states
-    ]
+    status_rows = []
+    for state in states:
+        subset = [row for row in rows if row["replication_state"] == state]
+        total_bytes = sum(int(row["bytes_total"]) for row in subset)
+        done_bytes = sum(int(row["bytes_done"]) for row in subset)
+        status_rows.append(
+            {
+                "status": state,
+                "row_count": len(subset),
+                "total_tib": total_bytes / 2**40,
+                "downloaded_tib": done_bytes / 2**40,
+                "remaining_tib": max(total_bytes - done_bytes, 0) / 2**40,
+            }
+        )
     with status_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("status", "row_count"))
+        writer = csv.DictWriter(handle, fieldnames=list(status_rows[0]))
         writer.writeheader()
         writer.writerows(status_rows)
 

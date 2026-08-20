@@ -55,6 +55,21 @@ verbatim. The current reporting grain is centre plus start date, matching the
 source workbook. Variable-level drill-down can be added after validating the
 real database's dataset IDs and query conventions.
 
+## Size-based dashboard fields
+
+The generated institution summary includes `total_tib`, `downloaded_tib`, and
+`remaining_tib`. The status summary includes the same size fields alongside
+`status` and `row_count`. This supports these Grist widgets:
+
+- replication size by status: `Status_Summary.status` / `total_tib`;
+- downloaded size by institution: `Institution_Summary.institution` /
+  `downloaded_tib`;
+- downloaded versus remaining: a stacked bar using `downloaded_tib` and
+  `remaining_tib` by institution.
+
+Rows that are not configured or have no ESGF match normally have no known size,
+so they remain visible in row counts but may not appear in size-based charts.
+
 ## Periodic VM refresh
 
 `update_c375_report.py` performs the complete refresh safely:
