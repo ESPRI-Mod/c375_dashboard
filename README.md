@@ -37,6 +37,9 @@ GRIST_API_KEY=... GRIST_DOC_ID=... python3 grist_sync.py --apply
 
 The default table ID is `C375_Replication`; override it with
 `GRIST_TABLE_ID` or `--table`. Rows are added or updated, never deleted.
+Temporary network failures, HTTP 408/425/429 responses, and server errors are
+retried four times with exponential backoff. Authentication and schema errors
+still fail immediately so configuration mistakes remain visible.
 
 ## Current matching rules
 

@@ -7,7 +7,9 @@ import argparse
 import csv
 import json
 import os
+import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,7 +63,17 @@ def payload(rows: list[dict[str, object]], key: str = "requirement_id") -> dict:
     }
 
 
-def put_batch(host: str, doc: str, table: str, token: str, body: dict) -> None:
+def put_batch(
+    host: str,
+    doc: str,
+    table: str,
+    token: str,
+    body: dict,
+    *,
+    timeout: float = 60,
+    retries: int = 4,
+    retry_delay: float = 5,
+) -> None:
     host = host.rstrip("/")
     path = "/api/docs/{}/tables/{}/records?onmany=none".format(
         urllib.parse.quote(doc, safe=""), urllib.parse.quote(table, safe="")
@@ -72,9 +84,27 @@ def put_batch(host: str, doc: str, table: str, token: str, body: dict) -> None:
         method="PUT",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        if response.status != 200:
-            raise RuntimeError(f"Grist returned HTTP {response.status}")
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Grist returned HTTP {response.status}")
+            return
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code in {408, 425, 429} or 500 <= exc.code < 600
+            if not retryable or attempt == retries:
+                raise
+        except (urllib.error.URLError, TimeoutError, socket.timeout):
+            if attempt == retries:
+                raise
+        delay = retry_delay * (2**attempt)
+        print(
+            f"Temporary Grist connection failure; retrying in {delay:g}s "
+            f"({attempt + 1}/{retries}).",
+            file=sys.stderr,
+            flush=True,
+        )
+        time.sleep(delay)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,6 +115,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--table", default=os.getenv("GRIST_TABLE_ID", "C375_Replication"))
     parser.add_argument("--key", default="requirement_id", help="Stable key column used for upserts")
     parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--timeout", type=float, default=60, help="Seconds per Grist request")
+    parser.add_argument("--retries", type=int, default=4, help="Retries for temporary failures")
+    parser.add_argument("--retry-delay", type=float, default=5, help="Initial retry delay in seconds")
     parser.add_argument("--apply", action="store_true", help="Actually send the upserts")
     args = parser.parse_args(argv)
     with args.input.open(newline="", encoding="utf-8") as handle:
@@ -102,10 +135,16 @@ def main(argv: list[str] | None = None) -> int:
             put_batch(
                 args.host, args.doc, args.table, token,
                 payload(rows[start:start + args.batch_size], args.key),
+                timeout=args.timeout,
+                retries=args.retries,
+                retry_delay=args.retry_delay,
             )
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         print(f"Grist HTTP {exc.code}: {detail}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        print(f"Grist connection failed after retries: {exc}", file=sys.stderr)
         return 1
     print(f"Upserted {len(rows)} rows into {args.table}.")
     return 0
