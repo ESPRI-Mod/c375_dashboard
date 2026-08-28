@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     for csv_path, table, key in jobs:
         rc = grist_sync.main([
             "--input", str(csv_path), "--host", host, "--doc", doc,
-            "--table", table, "--key", key, "--apply",
+            "--table", table, "--key", key, "--apply", "--prune",
         ])
         if rc:
             return rc
