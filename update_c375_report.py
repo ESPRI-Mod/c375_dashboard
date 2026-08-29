@@ -7,6 +7,7 @@ import argparse
 import os
 import sqlite3
 import sys
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,15 @@ import grist_sync
 def sqlite_backup(source: Path, backup_dir: Path, keep: int) -> Path:
     """Create and validate a transactionally consistent SQLite backup."""
     backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # A killed/failed run can leave the temporary database or SQLite journal
+    # sidecars behind.  Never touch recent files because another invocation may
+    # still be using them; artifacts older than one day are abandoned.
+    cutoff = time.time() - 86400
+    for artifact in backup_dir.glob(".c375-*.db.partial*"):
+        if artifact.stat().st_mtime < cutoff:
+            artifact.unlink()
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     final = backup_dir / f"c375-{stamp}.db"
     temporary = backup_dir / f".{final.name}.partial"
@@ -35,7 +45,19 @@ def sqlite_backup(source: Path, backup_dir: Path, keep: int) -> Path:
         dst.close()
         src.close()
 
-    check = sqlite3.connect(f"file:{temporary.resolve()}?mode=ro", uri=True)
+    # sqlite_backup may copy WAL persistence from the source.  Convert the
+    # completed snapshot to DELETE journal mode so it is a single portable
+    # file and no .partial-wal/.partial-shm files survive the rename.
+    normalize = sqlite3.connect(temporary)
+    try:
+        normalize.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        normalize.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        normalize.close()
+
+    check = sqlite3.connect(
+        f"file:{temporary.resolve()}?mode=ro&immutable=1", uri=True
+    )
     try:
         result = check.execute("PRAGMA quick_check").fetchone()[0]
     finally:
