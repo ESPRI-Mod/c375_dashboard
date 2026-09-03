@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from c375_dashboard import Requirement, _query_matches, build_snapshot
+from c375_dashboard import Requirement, _query_matches, build_snapshot, write_snapshot
 
 
 class SnapshotTest(unittest.TestCase):
@@ -24,32 +24,79 @@ class SnapshotTest(unittest.TestCase):
             db = Path(tmp) / "esgpull.db"
             conn = sqlite3.connect(db)
             conn.executescript("""
-              create table query(sha text primary key, selection_sha text);
-              create table selection_facet(selection_sha text, facet_sha text);
-              create table facet(sha text primary key, name text, value text);
-              create table tag(sha text primary key, name text);
-              create table query_tag(query_sha text, tag_sha text);
-              create table query_file(query_sha text, file_sha text);
-              create table file(sha text primary key, file_id text, dataset_id text,
-                                filename text, master_id text, size integer, status text);
-              insert into query values('ebe2ad','sel');
-              insert into facet values('f1','project','CMIP6Plus');
-              insert into facet values('f2','sub_experiment_id','s1960');
-              insert into facet values('f3','sub_experiment_id','s1961');
-              insert into selection_facet values('sel','f1');
-              insert into selection_facet values('sel','f2');
-              insert into selection_facet values('sel','f3');
-              insert into tag values('t1','dwd');
-              insert into query_tag values('ebe2ad','t1');
-              insert into file values('a','x.s1960-r1.pr.nc','x.s1960-r1.v1',
-                                      'pr_x_s1960-r1.nc','x.s1960-r1.pr.nc',100,'Done');
-              insert into file values('b','x.s1961-r1.pr.nc','x.s1961-r1.v1',
-                                      'pr_x_s1961-r1.nc','x.s1961-r1.pr.nc',300,'Error');
-              insert into file values('orphan','x.s1960-r1.extra.nc','x.s1960-r1.v1',
-                                      'extra_x_s1960-r1.nc','x.s1960-r1.extra.nc',9999,'Done');
-              insert into query_file values('ebe2ad','a');
-              insert into query_file values('ebe2ad','b');
-            """)
+                               create table query
+                               (
+                                   sha           text primary key,
+                                   selection_sha text
+                               );
+                               create table selection_facet
+                               (
+                                   selection_sha text,
+                                   facet_sha     text
+                               );
+                               create table facet
+                               (
+                                   sha   text primary key,
+                                   name  text,
+                                   value text
+                               );
+                               create table tag
+                               (
+                                   sha  text primary key,
+                                   name text
+                               );
+                               create table query_tag
+                               (
+                                   query_sha text,
+                                   tag_sha   text
+                               );
+                               create table query_file
+                               (
+                                   query_sha text,
+                                   file_sha  text
+                               );
+                               create table file
+                               (
+                                   sha        text primary key,
+                                   file_id    text,
+                                   dataset_id text,
+                                   filename   text,
+                                   master_id  text,
+                                   size       integer,
+                                   status     text
+                               );
+                               insert into query
+                               values ('ebe2ad', 'sel');
+                               insert into facet
+                               values ('f1', 'project', 'CMIP6Plus');
+                               insert into facet
+                               values ('f2', 'sub_experiment_id', 's1960');
+                               insert into facet
+                               values ('f3', 'sub_experiment_id', 's1961');
+                               insert into selection_facet
+                               values ('sel', 'f1');
+                               insert into selection_facet
+                               values ('sel', 'f2');
+                               insert into selection_facet
+                               values ('sel', 'f3');
+                               insert into tag
+                               values ('t1', 'dwd');
+                               insert into query_tag
+                               values ('ebe2ad', 't1');
+                               insert into file
+                               values ('a', 'x.s1960-r1.pr.nc', 'x.s1960-r1.v1',
+                                       'pr_x_s1960-r1.nc', 'x.s1960-r1.pr.nc', 100, 'Done');
+                               insert into file
+                               values ('b', 'x.s1961-r1.pr.nc', 'x.s1961-r1.v1',
+                                       'pr_x_s1961-r1.nc', 'x.s1961-r1.pr.nc', 300, 'Error');
+                               insert into file
+                               values ('orphan', 'x.s1960-r1.extra.nc', 'x.s1960-r1.v1',
+                                       'extra_x_s1960-r1.nc', 'x.s1960-r1.extra.nc', 9999, 'Done');
+                               insert into query_file
+                               values ('ebe2ad', 'a');
+                               insert into query_file
+                               values ('ebe2ad', 'b');
+                               """)
             conn.commit(); conn.close()
             def req(start):
                 return Requirement(start, 'DWD', start, 'dcpp-a', 'CMIP6 Plus', '', '', '', '', '', '')
@@ -61,6 +108,21 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(rows[1]['file_total'], 1)
             self.assertEqual(rows[1]['replication_state'], 'Error')
             self.assertEqual(rows[1]['completion'], 0.0)
+
+            output = Path(tmp) / "outputs" / "c375_dashboard.csv"
+            write_snapshot(rows, output)
+            with output.with_name("c375_status_summary.csv").open(newline="") as handle:
+                status = {row["status"]: row for row in csv.DictReader(handle)}
+
+            self.assertEqual(status["Complete"]["row_count"], "1")
+            self.assertEqual(float(status["Complete"]["downloaded_tib"]), 100 / 2**40)
+            self.assertEqual(float(status["Complete"]["remaining_tib"]), 0.0)
+            self.assertEqual(float(status["Complete"]["total_tib"]), 100 / 2**40)
+            self.assertEqual(status["Error"]["row_count"], "1")
+            self.assertEqual(float(status["Error"]["downloaded_tib"]), 0.0)
+            self.assertEqual(float(status["Error"]["remaining_tib"]), 300 / 2**40)
+            self.assertEqual(float(status["Error"]["total_tib"]), 300 / 2**40)
+            self.assertIn("Available", status)
 
 
 if __name__ == '__main__':

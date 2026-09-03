@@ -271,7 +271,14 @@ def write_snapshot(rows: list[dict], output: Path) -> None:
         writer.writerows(rows)
     output.with_suffix(".json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
     summary_path = output.with_name("c375_institution_summary.csv")
-    states = ("Complete", "In progress", "Error", "No ESGF match", "Not configured")
+    states = (
+        "Complete",
+        "In progress",
+        "Available",
+        "Error",
+        "No ESGF match",
+        "Not configured",
+    )
     summary_rows = []
     for centre in CENTRES:
         subset = [row for row in rows if row["centre"] == centre]
@@ -298,12 +305,20 @@ def write_snapshot(rows: list[dict], output: Path) -> None:
         writer.writerows(summary_rows)
 
     status_path = output.with_name("c375_status_summary.csv")
-    status_rows = [
-        {"status": state, "row_count": sum(row["replication_state"] == state for row in rows)}
-        for state in states
-    ]
+    status_rows = []
+    for state in states:
+        subset = [row for row in rows if row["replication_state"] == state]
+        total_bytes = sum(int(row["bytes_total"]) for row in subset)
+        downloaded_bytes = sum(int(row["bytes_done"]) for row in subset)
+        status_rows.append({
+            "status": state,
+            "row_count": len(subset),
+            "downloaded_tib": downloaded_bytes / 2**40,
+            "remaining_tib": max(total_bytes - downloaded_bytes, 0) / 2**40,
+            "total_tib": total_bytes / 2**40,
+        })
     with status_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("status", "row_count"))
+        writer = csv.DictWriter(handle, fieldnames=list(status_rows[0]))
         writer.writeheader()
         writer.writerows(status_rows)
 
