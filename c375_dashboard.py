@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SHEET_ID = "1PtIBS5rI85ebiylIgNQVXhJyZbVmFdnM0EZfP0RsJaI"
@@ -41,6 +42,26 @@ EXPERIMENTS = {
     "dcpp-a": "dcppA-hindcast",
     "dcpp-b": "dcppB-forecast",
 }
+
+HISTORY_FIELDS = (
+    "history_id",
+    "snapshot_time",
+    "institution",
+    "downloaded_tib",
+    "total_tib",
+    "remaining_tib",
+    "downloaded_delta_tib",
+    "elapsed_hours",
+    "daily_rate_tib_day",
+    "daily_rate_mib_s",
+    "weekly_rate_tib_day",
+    "weekly_rate_mib_s",
+    "eta_days",
+    "estimated_completion",
+    "rate_basis",
+)
+
+TIB_PER_DAY_TO_MIB_PER_SECOND = 2**20 / 86400
 
 
 @dataclass(frozen=True)
@@ -261,7 +282,162 @@ def build_snapshot(requirements: list[Requirement], db_path: Path) -> list[dict]
     return result
 
 
-def write_snapshot(rows: list[dict], output: Path) -> None:
+def _parse_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _rate(delta_tib: float, elapsed: timedelta) -> float | None:
+    days = elapsed.total_seconds() / 86400
+    if days <= 0 or delta_tib < 0:
+        return None
+    return delta_tib / days
+
+
+def update_history(
+    summary_rows: list[dict],
+    history_path: Path,
+    snapshot_time: datetime,
+    retention_days: int = 90,
+) -> tuple[dict[str, dict], list[dict]]:
+    """Append rate snapshots and return the latest metrics by institution."""
+    snapshot_time = snapshot_time.astimezone(timezone.utc)
+    existing: list[dict] = []
+    if history_path.exists():
+        with history_path.open(newline="", encoding="utf-8-sig") as handle:
+            existing = list(csv.DictReader(handle))
+
+    cutoff = snapshot_time - timedelta(days=retention_days)
+    valid_existing = []
+    for row in existing:
+        try:
+            when = _parse_time(row["snapshot_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cutoff <= when < snapshot_time:
+            valid_existing.append(row)
+
+    totals = list(summary_rows)
+    totals.append({
+        "institution": "ALL",
+        "downloaded_tib": sum(float(row["downloaded_tib"]) for row in summary_rows),
+        "total_tib": sum(float(row["total_tib"]) for row in summary_rows),
+    })
+
+    latest_metrics: dict[str, dict] = {}
+    new_rows: list[dict] = []
+    timestamp = snapshot_time.isoformat().replace("+00:00", "Z")
+    weekly_target = snapshot_time - timedelta(days=7)
+    for summary in totals:
+        institution = str(summary["institution"])
+        downloaded = float(summary["downloaded_tib"])
+        total = float(summary["total_tib"])
+        remaining = max(total - downloaded, 0.0)
+        prior = [
+            row for row in valid_existing
+            if row.get("institution") == institution
+        ]
+        prior.sort(key=lambda row: _parse_time(row["snapshot_time"]))
+        previous = prior[-1] if prior else None
+        last_reset = max(
+            (
+                index for index, row in enumerate(prior)
+                if row.get("rate_basis") == "Baseline reset"
+            ),
+            default=0,
+        )
+        weekly_prior = prior[last_reset:]
+        weekly_candidates = [
+            row for row in weekly_prior
+            if _parse_time(row["snapshot_time"]) <= weekly_target
+        ]
+        weekly_previous = weekly_candidates[-1] if weekly_candidates else None
+
+        daily_rate = None
+        downloaded_delta = None
+        elapsed_hours = None
+        if previous is not None:
+            previous_time = _parse_time(previous["snapshot_time"])
+            elapsed = snapshot_time - previous_time
+            downloaded_delta = downloaded - float(previous["downloaded_tib"])
+            elapsed_hours = elapsed.total_seconds() / 3600
+            daily_rate = _rate(downloaded_delta, elapsed)
+
+        weekly_rate = None
+        if weekly_previous is not None and (downloaded_delta is None or downloaded_delta >= 0):
+            weekly_elapsed = snapshot_time - _parse_time(weekly_previous["snapshot_time"])
+            weekly_delta = downloaded - float(weekly_previous["downloaded_tib"])
+            weekly_rate = _rate(weekly_delta, weekly_elapsed)
+
+        preferred_rate = weekly_rate if weekly_rate is not None and weekly_rate > 0 else daily_rate
+        if remaining <= 1e-9:
+            eta_days: float | None = 0.0
+            estimated_completion = timestamp
+            rate_basis = "Complete"
+        elif preferred_rate is not None and preferred_rate > 0:
+            eta_days = remaining / preferred_rate
+            estimated_completion = (
+                snapshot_time + timedelta(days=eta_days)
+            ).isoformat().replace("+00:00", "Z")
+            rate_basis = "Weekly" if weekly_rate is not None and weekly_rate > 0 else "Daily"
+        else:
+            eta_days = None
+            estimated_completion = ""
+            if previous is None:
+                rate_basis = "Establishing baseline"
+            elif downloaded_delta is not None and downloaded_delta < 0:
+                rate_basis = "Baseline reset"
+            else:
+                rate_basis = "Stalled"
+
+        metrics = {
+            "snapshot_time": timestamp,
+            "downloaded_delta_tib": downloaded_delta,
+            "elapsed_hours": elapsed_hours,
+            "daily_rate_tib_day": daily_rate,
+            "daily_rate_mib_s": (
+                daily_rate * TIB_PER_DAY_TO_MIB_PER_SECOND
+                if daily_rate is not None else None
+            ),
+            "weekly_rate_tib_day": weekly_rate,
+            "weekly_rate_mib_s": (
+                weekly_rate * TIB_PER_DAY_TO_MIB_PER_SECOND
+                if weekly_rate is not None else None
+            ),
+            "eta_days": eta_days,
+            "estimated_completion": estimated_completion,
+            "rate_basis": rate_basis,
+        }
+        latest_metrics[institution] = metrics
+        new_rows.append({
+            "history_id": f"{timestamp}|{institution}",
+            "snapshot_time": timestamp,
+            "institution": institution,
+            "downloaded_tib": downloaded,
+            "total_tib": total,
+            "remaining_tib": remaining,
+            **metrics,
+        })
+
+    history_rows = valid_existing + new_rows
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = history_path.with_suffix(history_path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+        writer.writeheader()
+        writer.writerows(history_rows)
+    temporary.replace(history_path)
+    return latest_metrics, history_rows
+
+
+def write_snapshot(
+    rows: list[dict],
+    output: Path,
+    snapshot_time: datetime | None = None,
+    history_days: int = 90,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as handle:
         if not rows:
@@ -299,6 +475,16 @@ def write_snapshot(rows: list[dict], output: Path) -> None:
             "total_tib": total_bytes / 2**40,
         }
         summary_rows.append(summary)
+
+    history_path = output.with_name("c375_institution_history.csv")
+    latest_metrics, _ = update_history(
+        summary_rows,
+        history_path,
+        snapshot_time or datetime.now(timezone.utc),
+        history_days,
+    )
+    for summary in summary_rows:
+        summary.update(latest_metrics[summary["institution"]])
     with summary_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(summary_rows[0]))
         writer.writeheader()
@@ -329,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--requirements", type=Path, default=Path("work/c375_requirements.csv"))
     parser.add_argument("--refresh-sheet", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("outputs/c375_dashboard.csv"))
+    parser.add_argument("--history-days", type=int, default=90)
     args = parser.parse_args(argv)
     if args.refresh_sheet or not args.requirements.exists():
         requirements = fetch_requirements(args.requirements)
@@ -338,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Captured {len(requirements)} planning rows in {args.requirements}; pass --db next.")
         return 0
     rows = build_snapshot(requirements, args.db)
-    write_snapshot(rows, args.output)
+    write_snapshot(rows, args.output, history_days=args.history_days)
     print(f"Wrote {len(rows)} dashboard rows to {args.output}")
     return 0
 

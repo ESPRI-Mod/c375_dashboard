@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-backups", type=int, default=14)
     parser.add_argument("--requirements", type=Path, default=Path("work/c375_requirements.csv"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    parser.add_argument("--history-days", type=int, default=90)
     parser.add_argument("--refresh-sheet", action="store_true")
     parser.add_argument("--no-publish", action="store_true", help="Build files but do not update Grist")
     args = parser.parse_args(argv)
@@ -88,7 +89,12 @@ def main(argv: list[str] | None = None) -> int:
     backup = sqlite_backup(args.db, args.backup_dir, args.keep_backups)
     print(f"Validated SQLite backup: {backup}")
     output = args.output_dir / "c375_dashboard.csv"
-    dashboard_args = ["--db", str(backup), "--requirements", str(args.requirements), "--output", str(output)]
+    dashboard_args = [
+        "--db", str(backup),
+        "--requirements", str(args.requirements),
+        "--output", str(output),
+        "--history-days", str(args.history_days),
+    ]
     if args.refresh_sheet:
         dashboard_args.append("--refresh-sheet")
     if c375_dashboard.main(dashboard_args) != 0:
@@ -107,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         (output, "C375_Replication", "requirement_id"),
         (args.output_dir / "c375_institution_summary.csv", "Institution_Summary", "institution"),
         (args.output_dir / "c375_status_summary.csv", "Status_Summary", "status"),
+        (args.output_dir / "c375_institution_history.csv", "Institution_History", "history_id"),
     )
     for csv_path, table, key in jobs:
         rc = grist_sync.main([

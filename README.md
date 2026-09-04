@@ -37,9 +37,6 @@ GRIST_API_KEY=... GRIST_DOC_ID=... python3 grist_sync.py --apply
 
 The default table ID is `C375_Replication`; override it with
 `GRIST_TABLE_ID` or `--table`. Rows are added or updated, never deleted.
-Temporary network failures, HTTP 408/425/429 responses, and server errors are
-retried four times with exponential backoff. Authentication and schema errors
-still fail immediately so configuration mistakes remain visible.
 
 ## Current matching rules
 
@@ -58,21 +55,6 @@ verbatim. The current reporting grain is centre plus start date, matching the
 source workbook. Variable-level drill-down can be added after validating the
 real database's dataset IDs and query conventions.
 
-## Size-based dashboard fields
-
-The generated institution summary includes `total_tib`, `downloaded_tib`, and
-`remaining_tib`. The status summary includes the same size fields alongside
-`status` and `row_count`. This supports these Grist widgets:
-
-- replication size by status: `Status_Summary.status` / `total_tib`;
-- downloaded size by institution: `Institution_Summary.institution` /
-  `downloaded_tib`;
-- downloaded versus remaining: a stacked bar using `downloaded_tib` and
-  `remaining_tib` by institution.
-
-Rows that are not configured or have no ESGF match normally have no known size,
-so they remain visible in row counts but may not appear in size-based charts.
-
 ## Periodic VM refresh
 
 `update_c375_report.py` performs the complete refresh safely:
@@ -81,8 +63,44 @@ so they remain visible in row counts but may not appear in size-based charts.
    of the live database (including committed WAL content).
 2. Runs `PRAGMA quick_check` on the copy before using it.
 3. Builds the report only from that validated copy.
-4. Upserts the detail, institution summary, and status summary tables in Grist.
+4. Upserts the detail, institution summary, status summary, and institution
+   history tables in Grist.
 5. Keeps the latest 14 backups by default.
+
+## Download rates and ETA
+
+Each successful local report build appends one small snapshot per institution,
+plus an `ALL` row, to `outputs/c375_institution_history.csv`. History is kept
+for 90 days by default; change this with `--history-days`. No history is written
+to the ESGpull database.
+
+The institution summary contains the latest daily rate (since the preceding
+snapshot), seven-day rate, and ETA. The ETA prefers the seven-day rate and uses
+the daily rate until a full week of history is available. A reduction in
+downloaded volume, such as after changing queries, resets the affected rate
+baseline instead of reporting a negative speed.
+
+Create a Grist table with ID `Institution_History` before enabling publication.
+Its unique key is the Text column `history_id`. Add these additional columns to
+both `Institution_Summary` and `Institution_History` where applicable:
+
+```text
+snapshot_time          DateTime
+downloaded_delta_tib   Numeric
+elapsed_hours          Numeric
+daily_rate_tib_day     Numeric
+daily_rate_mib_s       Numeric
+weekly_rate_tib_day    Numeric
+weekly_rate_mib_s      Numeric
+eta_days               Numeric
+estimated_completion   DateTime
+rate_basis             Text
+```
+
+`Institution_History` additionally needs `institution` (Text),
+`downloaded_tib`, `remaining_tib`, and `total_tib` (Numeric). These must be data
+columns because the synchronization script supplies their values. The history
+sync prunes records older than the locally retained window.
 
 Keep the Grist secret outside the scripts. For example, create
 `/home/abennasser/c3s/c375-report.env`, readable only by its owner:

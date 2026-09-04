@@ -19,6 +19,11 @@ INTEGER_FIELDS = {
     "not_configured_rows", "row_count",
 }
 FLOAT_FIELDS = {"completion", "downloaded_tib", "remaining_tib", "total_tib"}
+OPTIONAL_FLOAT_FIELDS = {
+    "downloaded_delta_tib", "elapsed_hours", "daily_rate_tib_day",
+    "daily_rate_mib_s", "weekly_rate_tib_day", "weekly_rate_mib_s", "eta_days",
+}
+DATETIME_FIELDS = {"snapshot_time", "estimated_completion"}
 
 
 def human_size(value: str | int | float) -> str:
@@ -44,6 +49,15 @@ def typed_row(row: dict[str, str]) -> dict[str, object]:
             result[key] = int(value or 0)
         elif key in FLOAT_FIELDS:
             result[key] = float(value or 0)
+        elif key in OPTIONAL_FLOAT_FIELDS:
+            result[key] = float(value) if value not in (None, "") else None
+        elif key in DATETIME_FIELDS:
+            if value in (None, ""):
+                result[key] = None
+            else:
+                from datetime import datetime
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                result[key] = parsed.timestamp()
         else:
             result[key] = value
     return result
