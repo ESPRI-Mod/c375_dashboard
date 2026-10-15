@@ -153,3 +153,33 @@ facet patterns for the same centre and experiment and substitutes only the
 missing `sub_experiment_id` values. It never changes the esgpull database. The
 commands should first be checked with `esgpull search`; adding, updating, and
 downloading remain separate, deliberate steps.
+
+## Exact-URL manifest reconciliation
+
+`manifest_esgpull.py` treats a one-URL-per-line manifest as the authoritative
+C375 file list. Resolution is checkpointed outside the production database.
+Reconciliation is a separate dry-run operation that plans missing-file
+insertion, replacement of failed or stale source URLs, requeuing, dashboard
+provenance links, and removal of queued files outside the manifest.
+
+```bash
+python3 manifest_esgpull.py --manifest manifest.txt audit
+
+python3 manifest_esgpull.py --manifest manifest.txt resolve \
+  --esgpull-root /home/abennasser/c3s \
+  --database-only
+
+python3 manifest_esgpull.py --manifest manifest.txt resolve \
+  --esgpull-root /home/abennasser/c3s \
+  --limit-batches 5
+
+python3 manifest_esgpull.py reconcile \
+  --esgpull-root /home/abennasser/c3s
+```
+
+The last command writes `outputs/manifest_reconciliation.tsv` without changing
+the ESGpull database. Once every URL is resolved, a validated backup has been
+taken, and the plan has been reviewed, pass `--apply`. The final `download`
+command passes only resolved manifest `File` objects to ESGpull's Python API.
+Downloaded files outside the manifest are retained; surplus queued database
+records are removed immediately during reconciliation.
