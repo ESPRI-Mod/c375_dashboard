@@ -169,6 +169,31 @@ def read_esgpull(db_path: Path) -> tuple[dict[str, dict[str, set[str]]], dict[st
         for row in conn.execute("select qt.query_sha, t.name from query_tag qt join tag t on t.sha=qt.tag_sha"):
             tags[row["query_sha"]].add(row["name"])
 
+    # Once manifest provenance exists, it becomes the reporting boundary. This
+    # excludes legacy query-linked files that remain in ESGpull/on disk but are
+    # no longer requested by the authoritative C375 manifest. Older backups
+    # without the marker retain the historical all-query-linked behavior.
+    manifest_query_shas = {
+        query_sha
+        for query_sha, facets in selections.items()
+        if "manifest_exact_url_provenance" in facets.get("query", set())
+    }
+    if manifest_query_shas:
+        selections = defaultdict(
+            lambda: defaultdict(set),
+            {
+                query_sha: selections[query_sha]
+                for query_sha in manifest_query_shas
+            },
+        )
+        tags = defaultdict(
+            set,
+            {
+                query_sha: tags.get(query_sha, set())
+                for query_sha in manifest_query_shas
+            },
+        )
+
     # Only query-linked files are dashboard inputs.  esgpull intentionally
     # retains orphan file records after a query is removed; those records may
     # still describe files on disk, but they are outside the current
@@ -180,6 +205,8 @@ def read_esgpull(db_path: Path) -> tuple[dict[str, dict[str, set[str]]], dict[st
       join query_file qf on qf.file_sha = f.sha
     """
     for row in conn.execute(linked_files_sql):
+        if manifest_query_shas and row["query_sha"] not in manifest_query_shas:
+            continue
         item = files.get(row["sha"])
         if item is None:
             item = {name: row[name] for name in row.keys() if name != "query_sha"}

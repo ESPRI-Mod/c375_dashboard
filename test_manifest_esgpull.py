@@ -1,7 +1,9 @@
 import sqlite3
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from pathlib import Path
 
 from manifest_esgpull import (
     ParsedURL,
@@ -128,6 +130,39 @@ class ManifestURLTests(unittest.TestCase):
             [row[0] for row in conn.execute("SELECT url FROM manifest_url")],
             [new.url],
         )
+
+    def test_download_command_synchronizes_corrected_manifest(self):
+        from manifest_esgpull import command_download
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "manifest.txt"
+            state = root / "state.sqlite"
+            manifest.write_text(SAMPLE + "\n", encoding="utf-8")
+            conn = sqlite3.connect(state)
+            conn.row_factory = sqlite3.Row
+            conn.executescript(STATE_SCHEMA)
+            conn.execute(
+                """INSERT INTO manifest_url
+                   (url, hostname, dataset_id_hint, status)
+                   VALUES ('https://bad..example/file', 'bad..example', NULL, 'invalid')"""
+            )
+            conn.commit()
+            conn.close()
+            args = SimpleNamespace(
+                manifest=manifest,
+                state=state,
+                esgpull_root=root,
+                direct_fallback=False,
+                allow_partial=False,
+            )
+            with self.assertRaises(SystemExit) as raised:
+                command_download(args)
+            self.assertIn("unresolved", str(raised.exception))
+            conn = sqlite3.connect(state)
+            urls = [row[0] for row in conn.execute("SELECT url FROM manifest_url")]
+            conn.close()
+            self.assertEqual(urls, [SAMPLE])
 
     def test_esgf_identity_match_keeps_manifest_replica(self):
         dataset_id = parse_manifest_url(SAMPLE).dataset_id

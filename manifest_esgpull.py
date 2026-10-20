@@ -976,7 +976,13 @@ def command_resolve(args: argparse.Namespace) -> int:
 
 
 def command_download(args: argparse.Namespace) -> int:
+    records, duplicates = read_manifest(args.manifest)
     conn = connect_state(args.state)
+    seed_state(conn, records)
+    print(
+        f"Synchronized checkpoint with {len(records):,} manifest URLs "
+        f"({duplicates:,} duplicate lines ignored)."
+    )
     counts = state_counts(conn)
     if not counts:
         raise SystemExit("State database is empty; run the resolve command first.")
@@ -1025,7 +1031,13 @@ def command_download(args: argparse.Namespace) -> int:
 
 
 def command_reconcile(args: argparse.Namespace) -> int:
+    records, duplicates = read_manifest(args.manifest)
     conn = connect_state(args.state)
+    seed_state(conn, records)
+    print(
+        f"Synchronized checkpoint with {len(records):,} manifest URLs "
+        f"({duplicates:,} duplicate lines ignored)."
+    )
     esg = make_esgpull(args.esgpull_root)
     actions = reconcile_manifest(
         conn, esg, report_path=args.report, apply=args.apply

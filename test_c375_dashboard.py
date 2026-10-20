@@ -124,6 +124,45 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(float(status["Error"]["total_tib"]), 300 / 2**40)
             self.assertIn("Available", status)
 
+            # Adding manifest provenance switches the collector to the
+            # manifest-authoritative boundary. Legacy linked files remain in
+            # the database but no longer contribute to the report.
+            conn = sqlite3.connect(db)
+            conn.executescript("""
+                               insert into query
+                               values ('manifest-q', 'manifest-sel');
+                               insert into facet
+                               values ('mf1', 'project', 'CMIP6Plus');
+                               insert into facet
+                               values ('mf2', 'sub_experiment_id', 's1960');
+                               insert into facet
+                               values ('mf3', 'query', 'manifest_exact_url_provenance');
+                               insert into selection_facet
+                               values ('manifest-sel', 'mf1');
+                               insert into selection_facet
+                               values ('manifest-sel', 'mf2');
+                               insert into selection_facet
+                               values ('manifest-sel', 'mf3');
+                               insert into query_tag
+                               values ('manifest-q', 't1');
+                               insert into file
+                               values ('manifest-file', 'x.s1960-r1.tas.nc',
+                                       'x.s1960-r1.v1', 'tas_x_s1960-r1.nc',
+                                       'x.s1960-r1.tas.nc', 50, 'Done');
+                               insert into query_file
+                               values ('manifest-q', 'manifest-file');
+                               """)
+            conn.commit(); conn.close()
+
+            manifest_rows = build_snapshot([req('s1960'), req('s1961')], db)
+            self.assertEqual(manifest_rows[0]['query_count'], 1)
+            self.assertEqual(manifest_rows[0]['file_total'], 1)
+            self.assertEqual(manifest_rows[0]['bytes_total'], 50)
+            self.assertEqual(manifest_rows[0]['replication_state'], 'Complete')
+            self.assertEqual(manifest_rows[1]['query_count'], 0)
+            self.assertEqual(manifest_rows[1]['file_total'], 0)
+            self.assertEqual(manifest_rows[1]['replication_state'], 'Not configured')
+
 
 if __name__ == '__main__':
     unittest.main()
