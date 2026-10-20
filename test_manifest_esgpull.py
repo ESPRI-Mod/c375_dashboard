@@ -1,6 +1,17 @@
+import sqlite3
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from manifest_esgpull import bookkeeping_key, dataset_facets, parse_manifest_url
+from manifest_esgpull import (
+    ParsedURL,
+    STATE_SCHEMA,
+    bookkeeping_key,
+    dataset_facets,
+    parse_manifest_url,
+    resolve_from_database,
+    seed_state,
+)
 
 
 SAMPLE = (
@@ -49,7 +60,72 @@ class ManifestURLTests(unittest.TestCase):
             ("bsc", "CMIP6", "dcppA-hindcast", "s1960"),
         )
 
+    def test_database_identity_keeps_manifest_url(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """CREATE TABLE manifest_url (
+                url TEXT PRIMARY KEY, hostname TEXT, dataset_id_hint TEXT,
+                status TEXT, source TEXT, metadata_json TEXT, error TEXT,
+                updated_at TEXT
+            );"""
+        )
+        manifest_url = SAMPLE.replace("esgf.ceda.ac.uk", "preferred.example")
+        dataset_id = parse_manifest_url(SAMPLE).dataset_id
+        conn.execute(
+            """INSERT INTO manifest_url
+               (url, hostname, dataset_id_hint, status)
+               VALUES (?, ?, ?, 'pending')""",
+            (manifest_url, "preferred.example", dataset_id),
+        )
+        fake_file = SimpleNamespace(
+            url=SAMPLE,
+            dataset_id=dataset_id,
+            filename=manifest_url.rsplit("/", 1)[-1],
+            asdict=lambda: {
+                "file_id": "id", "dataset_id": dataset_id,
+                "master_id": "master", "url": SAMPLE, "version": "v20200417",
+                "filename": manifest_url.rsplit("/", 1)[-1], "local_path": "path",
+                "data_node": "esgf.ceda.ac.uk", "checksum": "abc",
+                "checksum_type": "SHA256", "size": 1, "status": "Error",
+            },
+        )
+        fake_session = SimpleNamespace(scalars=lambda statement: [fake_file])
+        fake_esg = SimpleNamespace(db=SimpleNamespace(session=fake_session))
+        fake_sqlalchemy = SimpleNamespace(
+            select=lambda model: SimpleNamespace(
+                execution_options=lambda **kwargs: object()
+            )
+        )
+        with patch.dict(
+            "sys.modules",
+            {
+                "esgpull.models": SimpleNamespace(File=object),
+                "sqlalchemy": fake_sqlalchemy,
+            },
+        ):
+            count = resolve_from_database(conn, fake_esg)
+        self.assertEqual(count, 1)
+        row = conn.execute(
+            "SELECT status, source, metadata_json FROM manifest_url"
+        ).fetchone()
+        self.assertEqual(row["status"], "resolved")
+        self.assertEqual(row["source"], "database-file-identity")
+        self.assertEqual(__import__("json").loads(row["metadata_json"])["url"], manifest_url)
+
+    def test_revised_manifest_removes_stale_checkpoint_urls(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(STATE_SCHEMA)
+        old = ParsedURL("https://old.example/fileServer/old", "old.example", None)
+        new = ParsedURL("https://new.example/fileServer/new", "new.example", None)
+        seed_state(conn, [old])
+        seed_state(conn, [new])
+        self.assertEqual(
+            [row[0] for row in conn.execute("SELECT url FROM manifest_url")],
+            [new.url],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

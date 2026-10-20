@@ -149,6 +149,22 @@ def connect_state(path: Path) -> sqlite3.Connection:
 
 
 def seed_state(conn: sqlite3.Connection, records: Sequence[ParsedURL]) -> None:
+    # The manifest is authoritative. Keep resumable metadata for URLs that are
+    # still present, but discard checkpoint rows removed from a revised
+    # manifest (including corrected malformed URLs).
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS current_manifest_url "
+        "(url TEXT PRIMARY KEY)"
+    )
+    conn.execute("DELETE FROM current_manifest_url")
+    conn.executemany(
+        "INSERT INTO current_manifest_url(url) VALUES (?)",
+        [(record.url,) for record in records],
+    )
+    conn.execute(
+        "DELETE FROM manifest_url "
+        "WHERE url NOT IN (SELECT url FROM current_manifest_url)"
+    )
     conn.executemany(
         """
         INSERT OR IGNORE INTO manifest_url
@@ -192,13 +208,35 @@ def canonical_metadata(file: object) -> dict[str, object]:
 
 
 def resolve_from_database(conn: sqlite3.Connection, esg: object) -> int:
-    """Resolve exact URL matches already known to the ESGpull database."""
-    pending = {
-        row[0]
-        for row in conn.execute("SELECT url FROM manifest_url WHERE status = 'pending'")
-    }
-    if not pending:
+    """Resolve manifest files already known to the ESGpull database.
+
+    The manifest is authoritative for the source URL.  An existing record may
+    therefore be reused either by exact URL or by its stable ESGF identity
+    (dataset ID plus filename); in the latter case its trusted size/checksum
+    metadata is retained while the manifest URL replaces the old replica URL.
+    """
+    pending_rows = conn.execute(
+        """SELECT url, dataset_id_hint FROM manifest_url
+           WHERE status = 'pending'"""
+    ).fetchall()
+    if not pending_rows:
         return 0
+    pending_by_url = {row["url"]: row["url"] for row in pending_rows}
+    pending_by_identity: dict[tuple[str, str], str] = {}
+    ambiguous_identities: set[tuple[str, str]] = set()
+    for row in pending_rows:
+        dataset_id = row["dataset_id_hint"]
+        filename = Path(urlsplit(row["url"]).path).name
+        if not dataset_id or not filename:
+            continue
+        key = (dataset_id, filename)
+        if key in pending_by_identity:
+            ambiguous_identities.add(key)
+        else:
+            pending_by_identity[key] = row["url"]
+    for key in ambiguous_identities:
+        pending_by_identity.pop(key, None)
+
     from esgpull.models import File
     import sqlalchemy as sa
 
@@ -207,10 +245,24 @@ def resolve_from_database(conn: sqlite3.Connection, esg: object) -> int:
     result = esg.db.session.scalars(stmt)  # type: ignore[attr-defined]
     updates: list[tuple[str, str, str]] = []
     for file in result:
-        if file.url not in pending:
+        manifest_url = pending_by_url.get(file.url)
+        source = "database-exact-url"
+        if manifest_url is None:
+            manifest_url = pending_by_identity.get((file.dataset_id, file.filename))
+            source = "database-file-identity"
+        if manifest_url is None:
             continue
-        updates.append((json.dumps(canonical_metadata(file), separators=(",", ":")), "database", file.url))
-        pending.remove(file.url)
+        metadata = canonical_metadata(file)
+        metadata["url"] = manifest_url
+        updates.append(
+            (
+                json.dumps(metadata, separators=(",", ":")),
+                source,
+                manifest_url,
+            )
+        )
+        pending_by_url.pop(manifest_url, None)
+        pending_by_identity.pop((file.dataset_id, file.filename), None)
         count += 1
         if len(updates) >= 2_000:
             conn.executemany(
@@ -773,4 +825,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
