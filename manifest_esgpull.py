@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -121,6 +123,23 @@ def parse_manifest_url(value: str) -> ParsedURL:
     if len(dataset_parts) < 10:
         return ParsedURL(value, hostname, None, "incomplete CMIP dataset path")
     return ParsedURL(value, hostname, ".".join(dataset_parts))
+
+
+def manifest_local_path(value: str) -> tuple[str, str]:
+    """Return the ESGpull DRS directory and filename encoded in a URL."""
+    parsed = parse_manifest_url(value)
+    if parsed.error or parsed.dataset_id is None:
+        raise ValueError(parsed.error or value)
+    parts = [part for part in urlsplit(value).path.split("/") if part]
+    project_idx = next(
+        i for i, part in enumerate(parts) if part in {"CMIP6", "CMIP6Plus"}
+    )
+    version_idx = next(
+        i
+        for i in range(project_idx, len(parts) - 1)
+        if VERSION_RE.fullmatch(parts[i])
+    )
+    return "/".join(parts[project_idx : version_idx + 1]), parts[-1]
 
 
 def read_manifest(path: Path) -> tuple[list[ParsedURL], int]:
@@ -287,6 +306,23 @@ def normalize_search_url(url: str) -> str:
     return url.replace("http://", "https://", 1).rstrip("/")
 
 
+def match_manifest_file(
+    file: object,
+    wanted_by_url: dict[str, str],
+    wanted_by_identity: dict[tuple[str, str], str],
+) -> tuple[str, str] | None:
+    """Return the authoritative manifest URL and how it was matched."""
+    manifest_url = wanted_by_url.get(normalize_search_url(file.url))  # type: ignore[attr-defined]
+    if manifest_url is not None:
+        return manifest_url, "esgf-search-exact-url"
+    manifest_url = wanted_by_identity.get(
+        (file.dataset_id, file.filename)  # type: ignore[attr-defined]
+    )
+    if manifest_url is not None:
+        return manifest_url, "esgf-search-file-identity"
+    return None
+
+
 def resolve_from_esgf(
     conn: sqlite3.Connection,
     esg: object,
@@ -318,12 +354,28 @@ def resolve_from_esgf(
             batch_number += 1
             placeholders = ",".join("?" for _ in ids)
             manifest_rows = conn.execute(
-                f"""SELECT url FROM manifest_url WHERE status='pending'
+                f"""SELECT url, dataset_id_hint FROM manifest_url WHERE status='pending'
                      AND hostname=? AND dataset_id_hint IN ({placeholders})""",
                 [hostname, *ids],
             ).fetchall()
-            wanted = {normalize_search_url(row["url"]): row["url"] for row in manifest_rows}
-            if not wanted:
+            wanted_by_url = {
+                normalize_search_url(row["url"]): row["url"]
+                for row in manifest_rows
+            }
+            wanted_by_identity: dict[tuple[str, str], str] = {}
+            ambiguous: set[tuple[str, str]] = set()
+            for row in manifest_rows:
+                key = (
+                    row["dataset_id_hint"],
+                    Path(urlsplit(row["url"]).path).name,
+                )
+                if key in wanted_by_identity:
+                    ambiguous.add(key)
+                else:
+                    wanted_by_identity[key] = row["url"]
+            for key in ambiguous:
+                wanted_by_identity.pop(key, None)
+            if not wanted_by_url:
                 continue
 
             query = Query(
@@ -349,19 +401,30 @@ def resolve_from_esgf(
                 conn.executemany(
                     """UPDATE manifest_url SET error=?, updated_at=CURRENT_TIMESTAMP
                        WHERE url=? AND status='pending'""",
-                    [(message, original) for original in wanted.values()],
+                    [(message, original) for original in wanted_by_url.values()],
                 )
                 conn.commit()
                 continue
 
             updates: list[tuple[str, str, str]] = []
+            matched_urls: set[str] = set()
             for file in files:
-                original = wanted.get(normalize_search_url(file.url))
-                if original is None:
+                matched = match_manifest_file(
+                    file, wanted_by_url, wanted_by_identity
+                )
+                if matched is None:
                     continue
+                original, source = matched
+                if original in matched_urls:
+                    continue
+                matched_urls.add(original)
                 file.url = original
                 updates.append(
-                    (json.dumps(canonical_metadata(file), separators=(",", ":")), "esgf-search", original)
+                    (
+                        json.dumps(canonical_metadata(file), separators=(",", ":")),
+                        source,
+                        original,
+                    )
                 )
             if updates:
                 conn.executemany(
@@ -371,7 +434,7 @@ def resolve_from_esgf(
                 )
                 conn.commit()
                 resolved += len(updates)
-            searched += len(wanted)
+            searched += len(wanted_by_url)
             print(
                 f"Resolved {resolved:,}/{searched:,} searched URLs "
                 f"({hostname}, metadata batch {batch_number:,})",
@@ -534,6 +597,189 @@ async def register_and_download(
     return registered, completed, failed
 
 
+def direct_metadata(url: str, size: int, checksum: str) -> dict[str, object]:
+    parsed = parse_manifest_url(url)
+    if parsed.dataset_id is None or parsed.error:
+        raise ValueError(parsed.error or url)
+    local_path, filename = manifest_local_path(url)
+    dataset_master, version = parsed.dataset_id.rsplit(".", 1)
+    return {
+        "file_id": f"{parsed.dataset_id}.{filename}",
+        "dataset_id": parsed.dataset_id,
+        "master_id": f"{dataset_master}.{filename}",
+        "url": url,
+        "version": version,
+        "filename": filename,
+        "local_path": local_path,
+        "data_node": parsed.hostname,
+        "checksum": checksum,
+        "checksum_type": "SHA256",
+        "size": size,
+        "status": "Done",
+    }
+
+
+def hash_path(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+async def download_manifest_url(
+    client: object,
+    semaphore: asyncio.Semaphore,
+    data_root: Path,
+    url: str,
+) -> tuple[str, dict[str, object] | None, str | None]:
+    """Download one authoritative URL and compute its local SHA-256."""
+    import aiofiles
+
+    local_path, filename = manifest_local_path(url)
+    destination = data_root / local_path / filename
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file():
+        size, checksum = await asyncio.to_thread(hash_path, destination)
+        return url, direct_metadata(url, size, checksum), None
+
+    partial = destination.with_name(f".{filename}.manifest.part")
+    try:
+        async with semaphore:
+            digest = hashlib.sha256()
+            size = 0
+            async with client.stream("GET", url) as response:  # type: ignore[attr-defined]
+                response.raise_for_status()
+                async with aiofiles.open(partial, "wb") as handle:
+                    async for chunk in response.aiter_bytes(8 << 20):
+                        await handle.write(chunk)
+                        size += len(chunk)
+                        digest.update(chunk)
+            expected = response.headers.get("content-length")
+            if expected is not None and int(expected) != size:
+                raise RuntimeError(
+                    f"size mismatch: received {size}, Content-Length was {expected}"
+                )
+            os.replace(partial, destination)
+            return url, direct_metadata(url, size, digest.hexdigest()), None
+    except BaseException as exc:
+        return url, None, f"{type(exc).__name__}: {exc}"
+
+
+def register_direct_batch(
+    conn: sqlite3.Connection,
+    esg: object,
+    metadata_rows: list[dict[str, object]],
+) -> int:
+    from esgpull.models import Dataset, File, FileStatus
+    import sqlalchemy as sa
+
+    if not metadata_rows:
+        return 0
+    queries = ensure_bookkeeping_queries(esg, metadata_rows)
+    for metadata in metadata_rows:
+        incoming = File.fromdict(metadata)  # type: ignore[arg-type]
+        incoming.compute_sha()
+        dataset = esg.db.session.get(Dataset, incoming.dataset_id)
+        if dataset is None:
+            total_files = conn.execute(
+                "SELECT COUNT(*) FROM manifest_url WHERE dataset_id_hint=?",
+                (incoming.dataset_id,),
+            ).fetchone()[0]
+            esg.db.session.add(
+                Dataset(dataset_id=incoming.dataset_id, total_files=total_files)
+            )
+        existing = esg.db.session.get(File, incoming.sha)
+        if existing is None:
+            existing = esg.db.session.scalar(
+                sa.select(File).where(File.file_id == incoming.file_id)
+            )
+        if existing is None:
+            incoming.status = FileStatus.Done
+            existing = incoming
+            esg.db.session.add(existing)
+        else:
+            if existing.checksum != incoming.checksum:
+                raise RuntimeError(
+                    f"checksum conflict for existing file {incoming.file_id}"
+                )
+            existing.url = incoming.url
+            existing.size = incoming.size
+            existing.local_path = incoming.local_path
+            existing.status = FileStatus.Done
+        key = bookkeeping_key(metadata)
+        if key is None:
+            raise RuntimeError(f"cannot map {incoming.dataset_id!r} to dashboard")
+        esg.db.session.flush()
+        esg.db.link(queries[key], existing)
+    esg.db.session.commit()
+    return len(metadata_rows)
+
+
+async def direct_download_pending(
+    conn: sqlite3.Connection,
+    esg: object,
+    concurrency: int,
+    timeout: float,
+    batch_size: int,
+    limit_files: int | None,
+) -> tuple[int, int]:
+    import httpx
+
+    sql = "SELECT url FROM manifest_url WHERE status='pending' ORDER BY url"
+    params: tuple[object, ...] = ()
+    if limit_files is not None:
+        sql += " LIMIT ?"
+        params = (limit_files,)
+    urls = [row["url"] for row in conn.execute(sql, params)]
+    semaphore = asyncio.Semaphore(concurrency)
+    completed = failed = 0
+    limits = httpx.Limits(
+        max_connections=concurrency,
+        max_keepalive_connections=concurrency,
+    )
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(timeout),
+        limits=limits,
+    ) as client:
+        for url_batch in chunked(urls, batch_size):
+            results = await asyncio.gather(
+                *[
+                    download_manifest_url(
+                        client, semaphore, esg.config.paths.data, url
+                    )
+                    for url in url_batch
+                ]
+            )
+            successful: list[dict[str, object]] = []
+            for url, metadata, error in results:
+                if metadata is None:
+                    failed += 1
+                    conn.execute(
+                        """UPDATE manifest_url SET error=?,
+                           updated_at=CURRENT_TIMESTAMP WHERE url=?""",
+                        (error, url),
+                    )
+                else:
+                    successful.append(metadata)
+                    conn.execute(
+                        """UPDATE manifest_url SET status='resolved',
+                           source='manifest-direct', metadata_json=?, error=NULL,
+                           updated_at=CURRENT_TIMESTAMP WHERE url=?""",
+                        (json.dumps(metadata, separators=(",", ":")), url),
+                    )
+            conn.commit()
+            completed += register_direct_batch(conn, esg, successful)
+            print(
+                f"Manifest-direct: completed {completed:,}; failed {failed:,}",
+                flush=True,
+            )
+    return completed, failed
+
+
 def reconcile_manifest(
     conn: sqlite3.Connection,
     esg: object,
@@ -676,7 +922,13 @@ def make_esgpull(path: Path) -> object:
     from esgpull.esgpull import Esgpull
     from esgpull.tui import Verbosity
 
-    return Esgpull(path=path, verbosity=Verbosity.Detail, safe=True, load_db=True)
+    esg = Esgpull(path=path, verbosity=Verbosity.Detail, safe=True, load_db=True)
+    # Wait out short-lived writers rather than failing immediately. A common
+    # external flock should still be used to serialize long-running jobs.
+    from sqlalchemy import text
+
+    esg.db.session.execute(text("PRAGMA busy_timeout = 60000"))
+    return esg
 
 
 def command_audit(args: argparse.Namespace) -> int:
@@ -728,11 +980,16 @@ def command_download(args: argparse.Namespace) -> int:
     counts = state_counts(conn)
     if not counts:
         raise SystemExit("State database is empty; run the resolve command first.")
-    unresolved = sum(value for key, value in counts.items() if key != "resolved")
-    if unresolved and not args.allow_partial:
+    invalid = counts.get("invalid", 0)
+    pending = counts.get("pending", 0)
+    if invalid:
         raise SystemExit(
-            f"Refusing to continue with {unresolved:,} unresolved/invalid URLs; "
-            "inspect the report or pass --allow-partial."
+            f"Refusing to continue with {invalid:,} invalid URLs; correct the manifest first."
+        )
+    if pending and not args.direct_fallback and not args.allow_partial:
+        raise SystemExit(
+            f"Refusing to continue with {pending:,} unresolved URLs; inspect the "
+            "report, pass --direct-fallback, or explicitly pass --allow-partial."
         )
     esg = make_esgpull(args.esgpull_root)
     registered, completed, failed = asyncio.run(
@@ -746,7 +1003,25 @@ def command_download(args: argparse.Namespace) -> int:
     )
     action = "Registered" if args.register_only else "Processed"
     print(f"{action} {registered:,} files; downloaded {completed:,}; failed {failed:,}.")
-    return 1 if failed else 0
+    direct_completed = direct_failed = 0
+    if args.direct_fallback:
+        if args.register_only:
+            raise SystemExit("--direct-fallback cannot be combined with --register-only")
+        direct_completed, direct_failed = asyncio.run(
+            direct_download_pending(
+                conn,
+                esg,
+                concurrency=args.direct_concurrency,
+                timeout=args.http_timeout,
+                batch_size=args.direct_batch_size,
+                limit_files=args.direct_limit_files,
+            )
+        )
+        print(
+            f"Manifest-direct completed {direct_completed:,}; "
+            f"failed {direct_failed:,}."
+        )
+    return 1 if failed or direct_failed else 0
 
 
 def command_reconcile(args: argparse.Namespace) -> int:
@@ -814,6 +1089,15 @@ def parser() -> argparse.ArgumentParser:
     download.add_argument("--register-only", action="store_true")
     download.add_argument("--allow-partial", action="store_true")
     download.add_argument("--limit-files", type=int, help="small smoke-test limit")
+    download.add_argument(
+        "--direct-fallback",
+        action="store_true",
+        help="download pending URLs directly and register computed SHA-256 metadata",
+    )
+    download.add_argument("--direct-concurrency", type=int, default=8)
+    download.add_argument("--direct-batch-size", type=int, default=100)
+    download.add_argument("--direct-limit-files", type=int)
+    download.add_argument("--http-timeout", type=float, default=120.0)
     download.set_defaults(func=command_download)
     return result
 

@@ -7,7 +7,10 @@ from manifest_esgpull import (
     ParsedURL,
     STATE_SCHEMA,
     bookkeeping_key,
+    direct_metadata,
     dataset_facets,
+    match_manifest_file,
+    manifest_local_path,
     parse_manifest_url,
     resolve_from_database,
     seed_state,
@@ -125,6 +128,38 @@ class ManifestURLTests(unittest.TestCase):
             [row[0] for row in conn.execute("SELECT url FROM manifest_url")],
             [new.url],
         )
+
+    def test_esgf_identity_match_keeps_manifest_replica(self):
+        dataset_id = parse_manifest_url(SAMPLE).dataset_id
+        filename = SAMPLE.rsplit("/", 1)[-1]
+        manifest_url = SAMPLE.replace("esgf.ceda.ac.uk", "preferred.example")
+        indexed_file = SimpleNamespace(
+            url=SAMPLE,
+            dataset_id=dataset_id,
+            filename=filename,
+        )
+        matched = match_manifest_file(
+            indexed_file,
+            {manifest_url: manifest_url},
+            {(dataset_id, filename): manifest_url},
+        )
+        self.assertEqual(
+            matched,
+            (manifest_url, "esgf-search-file-identity"),
+        )
+
+    def test_direct_metadata_uses_manifest_drs(self):
+        local_path, filename = manifest_local_path(SAMPLE)
+        self.assertEqual(
+            local_path,
+            "CMIP6/DCPP/MOHC/HadGEM3-GC31-MM/dcppA-hindcast/"
+            "s1960-r10i1p1f2/AERday/zg500/gn/v20200417",
+        )
+        metadata = direct_metadata(SAMPLE, 123, "a" * 64)
+        self.assertEqual(metadata["filename"], filename)
+        self.assertEqual(metadata["size"], 123)
+        self.assertEqual(metadata["checksum_type"], "SHA256")
+        self.assertEqual(metadata["status"], "Done")
 
 
 if __name__ == "__main__":

@@ -183,3 +183,28 @@ taken, and the plan has been reviewed, pass `--apply`. The final `download`
 command passes only resolved manifest `File` objects to ESGpull's Python API.
 Downloaded files outside the manifest are retained; surplus queued database
 records are removed immediately during reconciliation.
+
+When metadata cannot be recovered from the existing database or ESGF search,
+the download command can use the manifest URL directly:
+
+```bash
+# Smoke-test ten unresolved URLs first.
+python3 manifest_esgpull.py download \
+  --esgpull-root /home/abennasser/c3s \
+  --limit-files 0 \
+  --direct-fallback \
+  --direct-limit-files 10
+
+# Continue all resolved ESGpull downloads and all remaining direct fallbacks.
+python3 manifest_esgpull.py download \
+  --esgpull-root /home/abennasser/c3s \
+  --batch-size 100 \
+  --direct-fallback \
+  --direct-concurrency 8
+```
+
+Direct fallback streams only the exact manifest URL into the configured ESGpull
+data tree, computes SHA-256 during transfer, and registers the completed file
+with `source=manifest-direct`. This checksum fingerprints the received content;
+unlike metadata-assisted downloads, it cannot independently verify the ESGF
+publisher's checksum. Invalid manifest URLs always remain a hard stop.
