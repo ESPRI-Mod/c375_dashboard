@@ -76,6 +76,10 @@ def classify(row: sqlite3.Row, file: dict | None) -> tuple[str, str]:
         return "Failed", error or "Invalid manifest URL"
     if file_status in {"error", "cancelled"}:
         return "Failed", error or f"ESGpull status: {file_status}"
+    # Metadata lookup is only an optimization. A pending URL remains valid
+    # manifest work and can still be handled by the direct-download fallback.
+    if checkpoint == "pending" and error.startswith("ESGF lookup failed"):
+        return "To download", "Awaiting direct fallback"
     if error:
         return "Failed", error
     return "To download", "Unresolved" if checkpoint == "pending" else "Queued"

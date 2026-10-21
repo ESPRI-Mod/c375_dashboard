@@ -27,6 +27,8 @@ class ManifestDashboardTest(unittest.TestCase):
              None, "network unavailable"),
             ("https://b.example/failed.nc", "b.example", "pending",
              None, "ConnectTimeout"),
+            ("https://b.example/lookup.nc", "b.example", "pending",
+             None, "ESGF lookup failed after 4 attempts: unavailable"),
             ("bad", "", "invalid", None, "malformed hostname"),
         ]
         conn.executemany("INSERT INTO manifest_url VALUES (?,?,?,?,?)", rows)
@@ -53,12 +55,12 @@ class ManifestDashboardTest(unittest.TestCase):
             statuses, hosts, failures = build_rows(state, db)
             status = {row["status"]: row for row in statuses}
             self.assertEqual(status["Downloaded"]["url_count"], 1)
-            self.assertEqual(status["To download"]["url_count"], 2)
+            self.assertEqual(status["To download"]["url_count"], 3)
             self.assertEqual(status["Failed"]["url_count"], 2)
             self.assertAlmostEqual(status["Downloaded"]["known_tib"], 100 / 2**40)
             host = {row["hostname"]: row for row in hosts}
             self.assertEqual(host["b.example"]["deferred_urls"], 1)
-            self.assertEqual(host["b.example"]["to_download_urls"], 1)
+            self.assertEqual(host["b.example"]["to_download_urls"], 2)
             self.assertEqual(sum(row["url_count"] for row in failures), 2)
 
     def test_writes_three_compact_csv_files(self):
