@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely snapshot a live esgpull SQLite database and refresh the C375 Grist report."""
+"""Safely snapshot ESGpull and publish a manifest-authoritative Grist report."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-import c375_dashboard
 import grist_sync
+import manifest_dashboard
 
 
 def sqlite_backup(source: Path, backup_dir: Path, keep: int) -> Path:
@@ -79,25 +79,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=Path("/home/abennasser/c3s/db/c375.db"))
     parser.add_argument("--backup-dir", type=Path, default=Path("/home/abennasser/c3s/backups"))
     parser.add_argument("--keep-backups", type=int, default=14)
-    parser.add_argument("--requirements", type=Path, default=Path("work/c375_requirements.csv"))
+    parser.add_argument(
+        "--manifest-state",
+        type=Path,
+        default=Path("outputs/manifest_state.sqlite"),
+        help="Checkpoint maintained by manifest_esgpull.py",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--history-days", type=int, default=90)
-    parser.add_argument("--refresh-sheet", action="store_true")
     parser.add_argument("--no-publish", action="store_true", help="Build files but do not update Grist")
     args = parser.parse_args(argv)
 
     backup = sqlite_backup(args.db, args.backup_dir, args.keep_backups)
     print(f"Validated SQLite backup: {backup}")
-    output = args.output_dir / "c375_dashboard.csv"
-    dashboard_args = [
+    if manifest_dashboard.main([
         "--db", str(backup),
-        "--requirements", str(args.requirements),
-        "--output", str(output),
-        "--history-days", str(args.history_days),
-    ]
-    if args.refresh_sheet:
-        dashboard_args.append("--refresh-sheet")
-    if c375_dashboard.main(dashboard_args) != 0:
+        "--state", str(args.manifest_state),
+        "--output-dir", str(args.output_dir),
+    ]) != 0:
         return 1
     if args.no_publish:
         print("Report built; Grist publication skipped.")
@@ -110,10 +108,9 @@ def main(argv: list[str] | None = None) -> int:
     host = os.getenv("GRIST_HOST", "https://grist.numerique.gouv.fr")
     doc = os.environ["GRIST_DOC_ID"]
     jobs = (
-        (output, "C375_Replication", "requirement_id"),
-        (args.output_dir / "c375_institution_summary.csv", "Institution_Summary", "institution"),
-        (args.output_dir / "c375_status_summary.csv", "Status_Summary", "status"),
-        (args.output_dir / "c375_institution_history.csv", "Institution_History", "history_id"),
+        (args.output_dir / "manifest_status_summary.csv", "Manifest_Status_Summary", "status"),
+        (args.output_dir / "manifest_host_summary.csv", "Manifest_Host_Summary", "hostname"),
+        (args.output_dir / "manifest_failure_summary.csv", "Manifest_Failure_Summary", "failure_id"),
     )
     for csv_path, table, key in jobs:
         rc = grist_sync.main([
@@ -122,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         ])
         if rc:
             return rc
-    print("C375 detail and dashboard summaries refreshed in Grist.")
+    print("Manifest URL dashboard summaries refreshed in Grist.")
     return 0
 
 

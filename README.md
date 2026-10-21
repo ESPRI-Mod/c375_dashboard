@@ -208,3 +208,40 @@ data tree, computes SHA-256 during transfer, and registers the completed file
 with `source=manifest-direct`. This checksum fingerprints the received content;
 unlike metadata-assisted downloads, it cannot independently verify the ESGF
 publisher's checksum. Invalid manifest URLs always remain a hard stop.
+
+## Manifest-based dashboard
+
+The scheduled report now treats `outputs/manifest_state.sqlite` as the list of
+required URLs and the validated ESGpull backup as their download state. It
+publishes compact aggregates rather than hundreds of thousands of URL rows:
+
+- `Manifest_Status_Summary`: three rows (`Downloaded`, `To download`, `Failed`)
+- `Manifest_Host_Summary`: counts and completion by source hostname
+- `Manifest_Failure_Summary`: failure counts grouped by host and error type
+
+Create those Grist tables with the following columns before the first publish:
+
+```text
+Manifest_Status_Summary
+  status Text (unique), url_count Integer, percentage Numeric,
+  known_tib Numeric, snapshot_time DateTime
+
+Manifest_Host_Summary
+  hostname Text (unique), total_urls Integer, downloaded_urls Integer,
+  to_download_urls Integer, failed_urls Integer, deferred_urls Integer,
+  completion Numeric, snapshot_time DateTime
+
+Manifest_Failure_Summary
+  failure_id Text (unique), hostname Text, failure_reason Text,
+  example_error Text, url_count Integer, snapshot_time DateTime
+```
+
+Build the CSV files without publishing:
+
+```bash
+python3 update_c375_report.py --keep-backups 1 --no-publish
+```
+
+A deferred URL remains part of the manifest and is counted as `To download`.
+Actual download errors are counted as `Failed`; a `Done` ESGpull record takes
+precedence over an error left by an older attempt.

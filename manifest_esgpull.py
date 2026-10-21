@@ -550,6 +550,32 @@ async def register_and_download(
         done, errors = await esg.download(list(queue), use_db=True, show_progress=True)
         completed += len(done)
         failed += len(errors)
+        for file in done:
+            conn.execute(
+                """UPDATE manifest_url SET error=NULL,
+                   updated_at=CURRENT_TIMESTAMP WHERE url=?""",
+                (file.url,),
+            )
+        for result in errors:
+            data = result.data
+            file = getattr(data, "file", data)
+            url = getattr(file, "url", "")
+            filename = getattr(file, "filename", "<unknown>")
+            message = f"{type(result.err).__name__}: {result.err}"
+            print(
+                f"ESGpull download failed: {filename}\n"
+                f"  URL: {url}\n"
+                f"  Error: {message}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if url:
+                conn.execute(
+                    """UPDATE manifest_url SET error=?,
+                       updated_at=CURRENT_TIMESTAMP WHERE url=?""",
+                    (message, url),
+                )
+        conn.commit()
         queue.clear()
 
     dataset_counts = Counter(

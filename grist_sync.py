@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,9 +17,13 @@ from pathlib import Path
 INTEGER_FIELDS = {
     "query_count", "file_total", "file_done", "file_error", "planning_rows",
     "complete_rows", "in_progress_rows", "error_rows", "no_match_rows",
-    "not_configured_rows", "row_count",
+    "not_configured_rows", "row_count", "url_count", "total_urls",
+    "downloaded_urls", "to_download_urls", "failed_urls", "deferred_urls",
 }
-FLOAT_FIELDS = {"completion", "downloaded_tib", "remaining_tib", "total_tib"}
+FLOAT_FIELDS = {
+    "completion", "downloaded_tib", "remaining_tib", "total_tib",
+    "percentage", "known_tib",
+}
 OPTIONAL_FLOAT_FIELDS = {
     "downloaded_delta_tib", "elapsed_hours", "daily_rate_tib_day",
     "daily_rate_mib_s", "weekly_rate_tib_day", "weekly_rate_mib_s", "eta_days",
@@ -75,7 +80,15 @@ def payload(rows: list[dict[str, object]], key: str = "requirement_id") -> dict:
     }
 
 
-def put_batch(host: str, doc: str, table: str, token: str, body: dict) -> None:
+def put_batch(
+    host: str,
+    doc: str,
+    table: str,
+    token: str,
+    body: dict,
+    retries: int = 4,
+    retry_delay: float = 5,
+) -> None:
     host = host.rstrip("/")
     path = "/api/docs/{}/tables/{}/records?onmany=all".format(
         urllib.parse.quote(doc, safe=""), urllib.parse.quote(table, safe="")
@@ -86,9 +99,26 @@ def put_batch(host: str, doc: str, table: str, token: str, body: dict) -> None:
         method="PUT",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        if response.status != 200:
-            raise RuntimeError(f"Grist returned HTTP {response.status}")
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Grist returned HTTP {response.status}")
+                return
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500 or attempt + 1 >= retries:
+                raise
+            delay = retry_delay * 2**attempt
+        except urllib.error.URLError:
+            if attempt + 1 >= retries:
+                raise
+            delay = retry_delay * 2**attempt
+        print(
+            f"Temporary Grist connection failure; retrying in {delay:g}s "
+            f"({attempt + 1}/{retries}).",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
 
 
 def fetch_records(host: str, doc: str, table: str, token: str) -> list[dict]:
